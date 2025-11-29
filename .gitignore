@@ -1,0 +1,29 @@
+.DS_Store/
+logs/
+data/
+datatools/
+__pycache__/
+.vscode/
+datasets/
+cuda_kernel_rasterize/build/
+datasets/NERF2/data/
+
+
+# submodules
+cuda_kernel_rasterize/dist
+cuda_kernel_rasterize/wireless_rasterizer.cpython-313-x86_64-linux-gnu.so
+cuda_kernel_rasterize/wireless_rasterizer.egg-info
+fused-ssim/dist
+debug_log.txt
+build/
+wireless_rasterizer.egg-info
+cuda-keyring_1.0-1_all.deb
+output_log.txt
+
+
+
+
+# results folder
+results_??_??/
+
+image-?.png
