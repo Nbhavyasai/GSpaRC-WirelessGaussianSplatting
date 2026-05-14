@@ -201,13 +201,6 @@ void CudaRasterizer::Rasterizer::markVisible(
 		present);
 }
 
-// __global__ void castIntToInt64Kernel(const int* input, int64_t* output, int size) {
-//     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-//     if (idx < size) {
-//         output[idx] = static_cast<int64_t>(input[idx]);
-//     }
-// }
-
 // Forward rendering procedure for differentiable rasterization
 // of Gaussians.
 int CudaRasterizer::Rasterizer::forward(

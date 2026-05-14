@@ -243,10 +243,6 @@ def plot_spectrum_compare(pred_spectrum, gt_spectrum, save_path=None):
         gt_spectrum (np.ndarray): Ground truth spectrum, shape (90, 360).
         save_path (str, optional): Path to save the plot. If None, the plot is displayed.
     """
-    # Normalize the spectra to [0, 1]
-    # pred_spectrum = (pred_spectrum - np.min(pred_spectrum)) / (np.max(pred_spectrum) - np.min(pred_spectrum) + 1e-8)
-    # gt_spectrum = (gt_spectrum - np.min(gt_spectrum)) / (np.max(gt_spectrum) - np.min(gt_spectrum) + 1e-8)
-
     # Create a polar grid
     r = np.linspace(0, 1, 91)  # Radial distance
     theta = np.linspace(0, 2 * np.pi, 361)

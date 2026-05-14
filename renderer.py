@@ -81,8 +81,8 @@ def render(wireless_data, pc : GaussianModel, wavelength=0, scaling_modifier=1.0
         "render": (signal_real.squeeze(0),signal_imag.squeeze(0)),
         "radii": radii,
         "viewspace_points": screenspace_points,
-        "visibility_filter" : (radii > 0).nonzero()
-
+        "visibility_filter" : (radii > 0),
+        "confidence": pc.get_confidence(wireless_data.rx_pos),
     }
 
     return out

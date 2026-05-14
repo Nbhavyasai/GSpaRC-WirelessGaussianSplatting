@@ -4,10 +4,10 @@ data/
 datatools/
 __pycache__/
 .vscode/
+scripts/
 datasets/
 cuda_kernel_rasterize/build/
-datasets/NERF2/data/
-
+notes.txt
 
 # submodules
 cuda_kernel_rasterize/dist
@@ -20,10 +20,14 @@ wireless_rasterizer.egg-info
 cuda-keyring_1.0-1_all.deb
 output_log.txt
 
+peek_ply.py
+cuda_test.py
+visualize_ptcloud.py
+hyperparameter_tuning.py
+point_cloud/
+wgs_rfspm_optimization_20250417_123236.db
 
-
+nohup.out
 
 # results folder
 results_??_??/
-
-image-?.png

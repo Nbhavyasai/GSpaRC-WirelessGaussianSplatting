@@ -43,7 +43,8 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self._emission_mlps = None  # Changed from nn.ModuleList()
-        self.mlp_size = [3, 16, 2]
+        self.spatial_lr_scale = 1.0
+        self.mlp_size = [3, 32, 2]
         self.centre_scheduler_args = None
         self.mlp_scheduler_args = None
         self.optimizer = None
@@ -58,6 +59,8 @@ class GaussianModel:
         elif self.debug:
             raise ValueError("Logger must be provided when debug mode is enabled.")
         self.setup_functions()
+        # Confidence MLP: initialized later in initialize_gaussians()
+        self._confidence_mlp = None
 
     def __repr__(self):
         """
@@ -96,13 +99,30 @@ class GaussianModel:
     def get_emission_mlps(self):
         return self._emission_mlps.get_all_params()
     
+    @property
+    def confidence_mlp(self):
+        return self._confidence_mlp
+    
+    def get_confidence(self, rx_pos):
+        """
+        Compute confidence score for a given receiver position.
+        
+        Args:
+            rx_pos: (3,) or (B, 3) tensor – receiver position(s)
+        Returns:
+            confidence: scalar or (B,) tensor, always > 1 (DUSt3R convention)
+        """
+        if self._confidence_mlp is None:
+            # Fallback: return 1.0 (no confidence weighting)
+            return torch.ones(1, device=rx_pos.device)
+        return self._confidence_mlp(rx_pos)
+    
     
     
     def initialize_gaussians(self, points): 
         """Initialize Gaussians using properties from PLY file"""
         centres = torch.tensor(points, dtype=torch.float32, device="cuda")
         num_gaussians = centres.shape[0]
-        # scales = torch.ones((num_gaussians, 3), device="cuda") * -2.99 # Same constant variance for all dimensions
         # centres: (N, 3) tensor on CUDA
         def nearest_neighbor_sqdist(points, batch_size=1024):
             N = points.size(0)
@@ -125,7 +145,7 @@ class GaussianModel:
 
         rots = torch.zeros((num_gaussians, 4), device="cuda")
         rots[:, 0] = 1  # identity matrix in the quaternion form
-        opacities = self.inverse_opacity_activation(0.5 * torch.ones((num_gaussians, 1), dtype=torch.float, device="cuda"))
+        opacities = self.inverse_opacity_activation(0.1 * torch.ones((num_gaussians, 1), dtype=torch.float, device="cuda"))
         
 
         # Convert to parameters
@@ -141,15 +161,19 @@ class GaussianModel:
                                         self.mlp_size[1], 
                                         self.mlp_size[2])
         
+        # Initialize confidence MLP (rx_pos → confidence scalar)
+        # Hidden size will be set properly in training_setup; use default for now
+        self._confidence_mlp = ConfidenceMLP(hidden_size=32)
+        
         print(f"Initialized {num_gaussians} Gaussians")
 
         
-    def training_setup(self, optim_params):
+    def training_setup(self, optim_params, spatial_lr_scale=None):
         # Set the learning rate for each learnable parameter
         self.centre_gradient_accum = torch.zeros((self.get_centre.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_centre.shape[0], 1), device="cuda")
         l = [
-            {'params': [self._centre], 'lr': optim_params.position_lr_init*5, "name": "centre"},
+            {'params': [self._centre], 'lr': optim_params.position_lr_init*self.spatial_lr_scale, "name": "centre"},
             {'params': [self._scaling], 'lr': optim_params.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': optim_params.rotation_lr, "name": "rotation"},
             {'params': [self._opacity], 'lr': optim_params.opacity_lr, "name": "opacity"},
@@ -159,14 +183,25 @@ class GaussianModel:
             {'params': [self._emission_mlps.fc2_bias], 'lr': optim_params.emission_mlp_lr, "name": "emission_fc2_bias"}
         ]
 
+        # Add confidence MLP parameters if it exists
+        if self._confidence_mlp is not None:
+            confidence_lr = getattr(optim_params, 'confidence_lr', 0.001)
+            # Re-initialise with the correct hidden size from config
+            hidden_size = getattr(optim_params, 'confidence_hidden_size', 32)
+            if self._confidence_mlp.fc1.out_features != hidden_size:
+                self._confidence_mlp = ConfidenceMLP(hidden_size=hidden_size)
+            for name, param in self._confidence_mlp.named_parameters():
+                l.append({'params': [param], 'lr': confidence_lr, 
+                         "name": f"confidence_{name}"})
+
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         # Add gradient clipping to optimizer
         for param_group in self.optimizer.param_groups:
             param_group['clip_grad_norm'] = 1.0  # Clip gradients to max norm of 1.0
 
-        self.centre_scheduler_args = get_expon_lr_func(lr_init=optim_params.position_lr_init*5,
-                                                    lr_final=optim_params.position_lr_final*5,
+        self.centre_scheduler_args = get_expon_lr_func(lr_init=optim_params.position_lr_init*self.spatial_lr_scale,
+                                                    lr_final=optim_params.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=optim_params.position_lr_delay_mult,
                                                     max_steps=optim_params.position_lr_max_steps)
         
@@ -219,6 +254,15 @@ class GaussianModel:
 
         return optimizable_tensors
                                 
+    # Names of optimizer param groups that hold per-Gaussian tensors.
+    # Any group not in this set (e.g. the confidence MLP) is global and must
+    # be skipped during densification / pruning.
+    PER_GAUSSIAN_GROUPS = {
+        "centre", "scaling", "rotation", "opacity",
+        "emission_fc1_weights", "emission_fc1_bias",
+        "emission_fc2_weights", "emission_fc2_bias",
+    }
+
     def _prune_optimizer(self, mask):
         """Prunes the optimizer's parameters based on the provided mask.
         Args:
@@ -227,6 +271,9 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             param_name = group["name"]
+            # Skip global (non per-Gaussian) param groups such as the confidence MLP.
+            if param_name not in self.PER_GAUSSIAN_GROUPS:
+                continue
             param = group["params"][0]
             stored_state = self.optimizer.state.get(param, None)
 
@@ -289,42 +336,6 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
-    # def cat_tensors_to_optimizer(self, tensors_dict):
-    #     """
-    #     Concatenates tensors from a given dictionary to the parameters of the optimizer.
-
-    #     This function takes a dictionary of tensors and concatenates each tensor to the corresponding
-    #     parameter in the optimizer's parameter groups. It also updates the optimizer's state to 
-    #     accommodate the new concatenated tensors.
-
-    #     Args:
-    #         tensors_dict (dict): A dictionary where keys are parameter group names and values are 
-    #                              tensors to be concatenated to the optimizer's parameters.
-
-    #     Returns:
-    #         dict: A dictionary where keys are parameter group names and values are the new concatenated 
-    #               parameters that are optimizable.
-    #     """
-    #     optimizable_tensors = {}
-    #     for group in self.optimizer.param_groups:
-    #         assert len(group["params"]) == 1
-    #         # For each parameter group, get the tensor to be concatenated
-    #         extension_tensor = tensors_dict[group["name"]]
-    #         # Extend the optimizer's state tensors when new gaussian parameters are added during densification
-    #         stored_state = self.optimizer.state.get(group['params'][0], None)
-    #         if stored_state is not None:
-    #             stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
-    #             stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
-    #             del self.optimizer.state[group['params'][0]]
-    #             group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
-    #             self.optimizer.state[group['params'][0]] = stored_state
-    #             optimizable_tensors[group["name"]] = group["params"][0]
-    #         else:
-    #             group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
-    #             optimizable_tensors[group["name"]] = group["params"][0]
-
-    #     return optimizable_tensors 
-
     def cat_tensors_to_optimizer(self, tensors_dict):
         """
         Concatenates tensors from a given dictionary to the parameters of the optimizer,
@@ -340,9 +351,12 @@ class GaussianModel:
         optimizable_tensors = {}
 
         for group in self.optimizer.param_groups:
-            assert len(group["params"]) == 1, f"Optimizer group {group['name']} must contain a single parameter"
-
             param_name = group["name"]
+            # Skip global (non per-Gaussian) param groups such as the confidence MLP.
+            if param_name not in self.PER_GAUSSIAN_GROUPS:
+                continue
+            assert len(group["params"]) == 1, f"Optimizer group {param_name} must contain a single parameter"
+
             base_tensor = group["params"][0]
             extension_tensor = tensors_dict[param_name]
 
@@ -453,19 +467,15 @@ class GaussianModel:
         # Select centres with high positional gradients
         selected_centres_mask = torch.where(padded_grad >= grad_threshold, True, False) 
         # Select centres with high positional gradients and scaling factors
-        selected_centres_mask = torch.logical_and(selected_centres_mask, 
-                                                  torch.max(self.get_scaling, dim=1).values > self.percent_dense * scaling_threshold) 
-        # num_selected = selected_centres_mask.sum().item()
-        # print(f"Number of selected centres: {num_selected}")
+        selected_centres_mask = torch.logical_and(selected_centres_mask,
+                                                  torch.max(self.get_scaling, dim=1).values > self.percent_dense * scaling_threshold)
 
         stds = self.get_scaling[selected_centres_mask].repeat(N, 1)  # Create N copies
-        # stds = torch.clamp(stds, min=0.0)  # Ensure all std values are non-negative
         means = torch.zeros((stds.size(0), 3), device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_centres_mask]).repeat(N,1,1) 
-        new_centre = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_centre[selected_centres_mask].repeat(N, 1) 
-        # new_scaling = self.scaling_inverse_activation(self._scaling[selected_centres_mask].repeat(N, 1) / (0.8 * N)) # Empirical scaling factor. Will validate.
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_centres_mask].repeat(N, 1)) #/ (0.8 * N)
+        new_centre = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_centre[selected_centres_mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_centres_mask].repeat(N, 1) / (0.6 * N))
         new_rotation = self._rotation[selected_centres_mask].repeat(N, 1)
         new_opacity = self._opacity[selected_centres_mask].repeat(N,1)
         new_emission_fc1_weights = self._emission_mlps.fc1_weights[selected_centres_mask].repeat(N, 1, 1)
@@ -474,13 +484,12 @@ class GaussianModel:
         new_emission_fc2_bias = self._emission_mlps.fc2_bias[selected_centres_mask].repeat(N, 1)
         new_tmp_radii = self.tmp_radii[selected_centres_mask].repeat(N)
         
-        self.densification_postfix(new_centre, new_scaling, new_rotation, new_opacity, new_emission_fc1_weights, new_emission_fc1_bias, new_emission_fc2_weights, new_emission_fc2_bias, new_tmp_radii)    
+        self.densification_postfix(new_centre, new_scaling, new_rotation, new_opacity, new_emission_fc1_weights, new_emission_fc1_bias, new_emission_fc2_weights, new_emission_fc2_bias, new_tmp_radii)
 
-        # # Need to prune selected_centres after splitting
+        # Need to prune selected_centres after splitting
         prune_mask = torch.cat((selected_centres_mask, torch.zeros(N * selected_centres_mask.sum(), dtype=torch.bool, device="cuda")))
         self.prune_points(prune_mask)
 
-    #new
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         selected_centres_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_centres_mask = torch.logical_and(selected_centres_mask, torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent)
@@ -498,8 +507,8 @@ class GaussianModel:
 
         self.densification_postfix(new_centre, new_scaling, new_rotation, new_opacity, new_emission_fc1_weights, new_emission_fc1_bias, new_emission_fc2_weights, new_emission_fc2_bias, new_tmp_radii)
 
-    #new
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii,
+                          scene_min=None, scene_max=None):
         grads = self.centre_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -512,6 +521,13 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+
+        # Prune Gaussians whose centres escaped the scene bounding box
+        if scene_min is not None and scene_max is not None:
+            centres = self.get_centre.detach()
+            out_of_bounds = (centres < scene_min).any(dim=1) | (centres > scene_max).any(dim=1)
+            prune_mask = torch.logical_or(prune_mask, out_of_bounds)
+
         self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
@@ -555,3 +571,39 @@ class EmissionMLPs():
             self.fc2_bias.view(-1),
         ]).contiguous()
     
+
+class ConfidenceMLP(nn.Module):
+    """
+    Small MLP: rx_pos (3D) → scalar confidence  C > 1.
+
+    Mirrors DUSt3R Eq. (4): the raw network output is passed through
+    1 + exp(·) so that C > 1, which forces the network to always
+    attempt reconstruction even for hard samples.
+
+    Architecture:  Linear(3 → H) → ReLU → Linear(H → 1)
+    """
+
+    def __init__(self, hidden_size=32):
+        super().__init__()
+        self.fc1 = nn.Linear(3, hidden_size)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_size, 1)
+        # Initialize fc2 bias so that initial confidence ≈ 1 + exp(0) = 2
+        nn.init.zeros_(self.fc2.bias)
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        self.to("cuda")
+
+    def forward(self, rx_pos):
+        """
+        Args:
+            rx_pos: (3,) or (B, 3) tensor – receiver position(s)
+        Returns:
+            confidence: scalar or (B,) tensor, always > 1
+        """
+        if rx_pos.dim() == 1:
+            rx_pos = rx_pos.unsqueeze(0)  # (1, 3)
+        raw = self.fc2(self.relu(self.fc1(rx_pos)))  # (B, 1)
+        confidence = 1.0 + torch.exp(raw)             # C > 1, matching DUSt3R
+        return confidence.squeeze(-1)                  # (B,) or scalar

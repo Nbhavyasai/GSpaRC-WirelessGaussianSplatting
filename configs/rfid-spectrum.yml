@@ -2,7 +2,7 @@
 ### Path settings
 path:
   expname: spectrum-exp1
-  datadir: datasets/NERF2/data/s23/
+  datadir: datasets/sionna/conference-room-mag  #datasets/NERF2/data/s23/
   logdir: logs/RFID/s23/
 
 

@@ -15,10 +15,11 @@ __device__ void computeSignalFromMLP(
 ) 
 {
     const int input_size = 3;
-    const int hidden_size = 16;
+    const int hidden_size = 32;
     const int output_size = 2;
+    const float leaky_slope = 0.01f;
 
-    float input[input_size] = {tx_pos.x, tx_pos.y, tx_pos.z};
+    float input[input_size] = {rx_pos.x, rx_pos.y, rx_pos.z};
 
     int fc1_weights_size = hidden_size * input_size;
     int fc1_bias_size = hidden_size;
@@ -40,52 +41,61 @@ __device__ void computeSignalFromMLP(
     float log_d = logf(d + 1e-6f);
     glm::vec3 unit_dir = diff / (d + 1e-6f);
 
-    float hidden[hidden_size] = {0.0f};
+    // Hidden layer with leaky ReLU; remember pre-activation for the backward derivative.
+    float hidden_pre[hidden_size] = {0.0f};
+    float hidden    [hidden_size] = {0.0f};
     for (int i = 0; i < hidden_size; ++i) {
         float sum = 0.0f;
         for (int j = 0; j < input_size; ++j) {
             sum += fc1_weights[i * input_size + j] * input[j];
         }
-        hidden[i] = fmaxf(sum + fc1_bias[i], 0.0f);  // ReLU
+        sum += fc1_bias[i];
+        hidden_pre[i] = sum;
+        hidden[i] = (sum > 0.0f) ? sum : (leaky_slope * sum);
     }
 
-    float pre_relu_output[output_size] = {0.0f};
-    float relu_output[output_size] = {0.0f};
+    // Output layer: linear pre-activation, then sigmoid with log-distance bias.
+    // No ReLU between fc2 and sigmoid (the prior version blocked the lower half of the sigmoid).
+    float pre_out       [output_size] = {0.0f};
     float sigmoid_output[output_size] = {0.0f};
-
     for (int i = 0; i < output_size; ++i) {
         float sum = 0.0f;
         for (int j = 0; j < hidden_size; ++j) {
             sum += fc2_weights[i * hidden_size + j] * hidden[j];
         }
         sum += fc2_bias[i];
-        pre_relu_output[i] = sum;
-        relu_output[i] = fmaxf(sum, 0.0f);
-        float attenuated = relu_output[i] - log_d;
+        pre_out[i] = sum;
+        float attenuated = sum - log_d;
         sigmoid_output[i] = 1.0f / (1.0f + expf(-attenuated));
     }
 
+    // ── Backward ──
+    // d output_i / d attenuated_i = sigmoid * (1 - sigmoid)
+    // d attenuated_i / d pre_out_i = 1
+    // d attenuated_i / d log_d     = -1
     float d_output[output_size] = {
         dL_dsignalreal[idx] * sigmoid_output[0] * (1.0f - sigmoid_output[0]),
         dL_dsignalimag[idx] * sigmoid_output[1] * (1.0f - sigmoid_output[1])
     };
 
+    // log_d gets a -1 contribution from every output (no ReLU gate).
     float dL_dlogd = 0.0f;
     for (int i = 0; i < output_size; ++i) {
-        if (pre_relu_output[i] > 0.0f) {
-            dL_dlogd -= d_output[i];  // ∂/∂log_d is -1
-        } else {
-            d_output[i] = 0.0f;  // Block gradient if ReLU was zero
-        }
+        dL_dlogd -= d_output[i];
     }
 
-    glm::vec3 dL_dmean = dL_dlogd * unit_dir;
+    // log_d = log(d + eps),  d/dd = 1/(d + eps)
+    // d = ||diff||,           d(d)/d(diff) = unit_dir
+    // diff = tx_pos - means,  d(diff)/d(means) = -I
+    // => dL/dmeans = -(dL/dlogd / (d+eps)) * unit_dir
+    float dL_dd = dL_dlogd / (d + 1e-6f);
+    glm::vec3 dL_dmean = -dL_dd * unit_dir;
     dL_dmeans3D[idx] += dL_dmean;
 
     float d_hidden[hidden_size] = {0.0f};
     float d_input[input_size] = {0.0f};
 
-    // fc2 backprop
+    // fc2 backprop  (d_output[i] is dL/dpre_out[i], since pre_out -> attenuated is just a shift)
     for (int i = 0; i < output_size; ++i) {
         for (int j = 0; j < hidden_size; ++j) {
             dL_demission_mlps[offset3 + i * hidden_size + j] = d_output[i] * hidden[j];
@@ -94,157 +104,18 @@ __device__ void computeSignalFromMLP(
         dL_demission_mlps[offset4 + i] = d_output[i];
     }
 
-    // fc1 backprop
+    // fc1 backprop with leaky-ReLU derivative
     for (int i = 0; i < hidden_size; ++i) {
-        if (hidden[i] > 0.0f) {
-            for (int j = 0; j < input_size; ++j) {
-                dL_demission_mlps[offset1 + i * input_size + j] = d_hidden[i] * input[j];
-                d_input[j] += d_hidden[i] * fc1_weights[i * input_size + j];
-            }
-            dL_demission_mlps[offset2 + i] = d_hidden[i];
-        } else {
-            for (int j = 0; j < input_size; ++j)
-                dL_demission_mlps[offset1 + i * input_size + j] = 0.0f;
-            dL_demission_mlps[offset2 + i] = 0.0f;
+        float dpre = (hidden_pre[i] > 0.0f) ? d_hidden[i] : (leaky_slope * d_hidden[i]);
+        for (int j = 0; j < input_size; ++j) {
+            dL_demission_mlps[offset1 + i * input_size + j] = dpre * input[j];
+            d_input[j] += dpre * fc1_weights[i * input_size + j];
         }
+        dL_demission_mlps[offset2 + i] = dpre;
     }
 
-    // (Optional) use d_input if tx_pos is learnable
+    // (Optional) use d_input if tx_pos / rx_pos is learnable
 }
-
-
-// __device__ void computeSignalFromMLP(int idx, int num_gaussians, const glm::vec3* means, glm::vec3 rx_pos, glm::vec3 tx_pos, const float* mlp_params, float* dL_dsignalreal, float* dL_dsignalimag, glm::vec3* dL_dmeans3D, float* dL_demission_mlps)
-// {
-//     // Constants
-//     const int input_size = 5;
-//     const int hidden_size = 16;
-//     const int output_size = 2;
-
-//     // Debugging: Print intermediate values
-//     // if (idx == 0) {  // Print for the first Gaussian
-//     //     printf("computeSignalFromMLP - Start\n");
-//     //     printf("means[%d]: (%f, %f, %f)\n", idx, means[idx].x, means[idx].y, means[idx].z);
-//     //     printf("rx_pos: (%f, %f, %f)\n", rx_pos.x, rx_pos.y, rx_pos.z);
-//     //     printf("tx_pos: (%f, %f, %f)\n", tx_pos.x, tx_pos.y, tx_pos.z);
-//     // }
-
-//     // Direction computation
-//     glm::vec3 pos = means[idx];
-//     glm::vec3 dir_orig = pos - rx_pos;
-//     float dir_length = glm::length(dir_orig);
-
-//     // Debugging: Check for invalid direction length
-//     // if (idx == 0 && (dir_length == 0.0f || isnan(dir_length) || isinf(dir_length))) {
-//     //     printf("computeSignalFromMLP - Invalid direction length: %f\n", dir_length);
-//     // }
-
-//     glm::vec3 dir = dir_orig / dir_length;
-
-//     // Debugging: Print direction
-//     // if (idx == 0) {
-//     //     printf("computeSignalFromMLP - dir: (%f, %f, %f)\n", dir.x, dir.y, dir.z);
-//     // }
-
-//     // Azimuth and Elevation
-//     float azimuth = atan2(dir.y, dir.x);
-//     float elevation = acos(dir.z);
-
-//     // Debugging: Check for NaN in azimuth and elevation
-//     // if (idx == 0 && (isnan(azimuth) || isnan(elevation))) {
-//     //     printf("computeSignalFromMLP - NaN in azimuth or elevation: azimuth=%f, elevation=%f\n", azimuth, elevation);
-//     // }
-
-// 	// Compute partial derivatives for azimuth and elevation
-//     float denom = dir.x * dir.x + dir.y * dir.y;
-//     float d_azimuth_dx = -dir.y / denom;
-//     float d_azimuth_dy = dir.x / denom;
-// 	float d_elevation_dz = -1.0f / sqrtf(1.0f - dir.z * dir.z + 1e-6f);  // avoid div by zero
-
-//     // Input
-//     float input[input_size] = {tx_pos.x, tx_pos.y, tx_pos.z, azimuth, elevation};
-
-//     // compute the size of each section in the flattened tensor
-//     int fc1_weights_size = hidden_size * input_size;
-//     int fc1_bias_size = hidden_size;
-//     int fc2_weights_size = output_size * hidden_size;
-//     int fc2_bias_size = output_size;
-
-//     // compute the offsets based on idx and num_gaussians
-//     int offset1 = idx * fc1_weights_size;  // for fc1_weights
-//     int offset2 = num_gaussians * fc1_weights_size + idx * fc1_bias_size;  // for fc1_bias
-//     int offset3 = num_gaussians * fc1_weights_size + num_gaussians * fc1_bias_size + idx * fc2_weights_size;  // for fc2_weights
-//     int offset4 = num_gaussians * fc1_weights_size + num_gaussians * fc1_bias_size + num_gaussians * fc2_weights_size + idx * fc2_bias_size;  // for fc2_bias
-
-//     // access weights and biases
-//     const float* fc1_weights = &mlp_params[offset1];
-//     const float* fc1_bias = &mlp_params[offset2];
-//     const float* fc2_weights = &mlp_params[offset3];
-//     // const float* fc2_bias = &mlp_params[offset4]; 	// not useful
-
-//     // Intermediate values from forward pass
-//     float hidden[hidden_size] = {0.0f};
-//     float d_hidden[hidden_size] = {0.0f};
-// 	float d_input[input_size] = {0.0f};
-
-//     // Forward pass for hidden layer
-//     for (int i = 0; i < hidden_size; ++i) {
-//         float sum = 0.0f;
-//         for (int j = 0; j < input_size; ++j) {
-//             sum += fc1_weights[i * input_size + j] * input[j];
-//         }
-//         hidden[i] = fmaxf(sum + fc1_bias[i], 0.0f); // ReLU activation
-//     }
-
-//     // Gradients for output layer
-//     float d_output[output_size] = {dL_dsignalreal[idx], dL_dsignalimag[idx]};
-
-//     // Gradients for fc2 weights and biases
-//     for (int i = 0; i < output_size; ++i) {
-//         for (int j = 0; j < hidden_size; ++j) {
-//             dL_demission_mlps[offset3 + i * hidden_size + j] = d_output[i] * hidden[j];
-//             d_hidden[j] += d_output[i] * fc2_weights[i * hidden_size + j];
-//         }
-//         dL_demission_mlps[offset4 + i] = d_output[i]; // Bias gradient
-//     }
-
-//     // Gradients for fc1 weights and biases
-//     for (int i = 0; i < hidden_size; ++i) {
-//         if (hidden[i] > 0.0f) { // ReLU derivative
-//             for (int j = 0; j < input_size; ++j) {
-//                 dL_demission_mlps[offset1 + i * input_size + j] = d_hidden[i] * input[j];
-// 				d_input[j] += d_hidden[i] * fc1_weights[i * input_size + j];
-//             }
-//             dL_demission_mlps[offset2 + i] = d_hidden[i]; // Bias gradient
-//         } else {
-//             // If ReLU is inactive, gradient is 0
-//             for (int j = 0; j < input_size; ++j) {
-//                 dL_demission_mlps[offset1 + i * input_size + j] = 0.0f;
-// 				d_input[j] += 0.0f;
-//             }
-//             dL_demission_mlps[offset2 + i] = 0.0f;
-//         }
-//     }
-
-// 	// The view direction is an input to the computation. View direction
-// 	// is influenced by the Gaussian's mean, so MLPs gradients
-// 	// must propagate back into 3D position.
-// 	float dL_dazimuth = d_input[3];
-// 	float dL_delevation = d_input[4];
-
-// 	float dL_dx = dL_dazimuth * d_azimuth_dx;		// only affected by azimuth
-// 	float dL_dy = dL_dazimuth * d_azimuth_dy;		// only affected by azimuth
-// 	float dL_dz = dL_delevation * d_elevation_dz;	// only affected by elevation
-
-// 	glm::vec3 dL_ddir(dL_dx, dL_dy, dL_dz);
-
-// 	// Account for normalization of direction
-// 	float3 dL_dmean = dnormvdv(float3{ dir_orig.x, dir_orig.y, dir_orig.z }, float3{ dL_ddir.x, dL_ddir.y, dL_ddir.z });
-	
-// 	// Gradients of loss w.r.t. Gaussian means, but only the portion 
-// 	// that is caused because the mean affects the view-dependent color.
-// 	// Additional mean gradient is accumulated in below methods.
-// 	dL_dmeans3D[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
-// }
 
 
 // Backward version of INVERSE 2D covariance matrix computation
@@ -260,7 +131,6 @@ __global__ void computeCov2DCUDA(int P,
 	const float* opacities,
 	const float* dL_dconics,
 	float* dL_dopacity,
-	// const float* dL_dinvdepth,
 	float3* dL_dmeans3D,
 	float* dL_dcov,
 	float3* dpx_dt,
@@ -438,7 +308,7 @@ __global__ void computeCov2DCUDA(int P,
 __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const glm::vec4 rot, const float* dL_dcov3Ds, glm::vec3* dL_dscales, glm::vec4* dL_drots)
 {
 	// Recompute (intermediate) results for the 3D covariance computation.
-	glm::vec4 q = rot;// / glm::length(rot);
+	glm::vec4 q = rot;
 	float r = q.x;
 	float x = q.y;
 	float y = q.z;
@@ -497,7 +367,7 @@ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const gl
 
 	// Gradients of loss w.r.t. unnormalized quaternion
 	float4* dL_drot = (float4*)(dL_drots + idx);
-	*dL_drot = float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w };//dnormvdv(float4{ rot.x, rot.y, rot.z, rot.w }, float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w });
+	*dL_drot = float4{ dL_dq.x, dL_dq.y, dL_dq.z, dL_dq.w };
 }
 
 
@@ -539,12 +409,6 @@ __global__ void preprocessCUDA(
 	if (idx >= P || !(radii[idx] > 0))
 		return;
 
-	// float3 m = means[idx];
-
-	// // Taking care of gradients from the screenspace points
-	// float4 m_hom = transformPoint4x4(m, proj);
-	// float m_w = 1.0f / (m_hom.w + 0.0000001f);
-
 	// Taking care of gradients from the screenspace points
 	float dsx_dpx = 2.0f / (float)width;
 	float dsy_dpy = 2.0f / (float)height;
@@ -565,10 +429,6 @@ __global__ void preprocessCUDA(
 	// of cov2D and following SH conversion also affects it.
 	dL_dmeans3D[idx] += dL_dmean;
 
-	// // Compute gradient updates due to computing colors from SHs
-	// if (shs)
-	// 	computeColorFromSH(idx, D, M, (glm::vec3*)means, *campos, shs, clamped, (glm::vec3*)dL_dcolor, (glm::vec3*)dL_dmeans, (glm::vec3*)dL_dsh);
-	// const glm::vec3 rx_pos = glm::vec3(0.0f); // hard coding to origin for now
 	computeSignalFromMLP(idx, P, (glm::vec3*)means3D, *rx_pos, *tx_pos, emission_mlps, dL_dsigreal, dL_dsigimag, (glm::vec3*)dL_dmeans3D, dL_demission_mlps);
 
 	// Compute gradient updates due to computing covariance from scale/rotation
@@ -601,9 +461,6 @@ renderCUDA(
 	float* __restrict__ dL_demission_mlps
 )
 {
-	// // Initialize C to 1
-	// constexpr uint32_t C = 1;
-
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -626,7 +483,6 @@ renderCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_signal_real[C * BLOCK_SIZE];
     __shared__ float collected_signal_imag[C * BLOCK_SIZE];
-	// __shared__ float collected_depths[BLOCK_SIZE];
 
 
 	// In the forward, we stored the final value for T, the
@@ -658,10 +514,8 @@ renderCUDA(
 	float last_signal_imag[C] = { 0 };
 
 
-	// Gradient of pixel coordinate w.r.t. normalized 
+	// Gradient of pixel coordinate w.r.t. normalized
 	// screen-space viewport corrdinates (-1 to 1)
-
-	////Need to update this based on our logic
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 
@@ -672,13 +526,9 @@ renderCUDA(
 		// and load them in reverse order.
 		block.sync();
 		const int progress = i * BLOCK_SIZE + block.thread_rank();
-		// printf("Before Entering loop: Thread %d, range.x = %u, range.y = %u, progress = %d\n", block.thread_rank(), range.x, range.y, progress);
 
 		if (range.x + progress < range.y)
 		{
-			// Print debug information
-			// printf("Entering loop: Thread %d, range.x = %u, range.y = %u, progress = %d\n", block.thread_rank(), range.x, range.y, progress);
-
 			const int coll_id = point_list[range.y - progress - 1];
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];

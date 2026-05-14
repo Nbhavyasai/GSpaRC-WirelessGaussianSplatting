@@ -22,10 +22,11 @@ __device__ glm::vec3 computeSignalFromMLP(
 ) 
 {
     const int input_size = 3;
-    const int hidden_size = 16;
+    const int hidden_size = 32;
     const int output_size = 2;
+    const float leaky_slope = 0.01f;
 
-    float input[input_size] = {tx_pos.x, tx_pos.y, tx_pos.z};
+    float input[input_size] = {rx_pos.x, rx_pos.y, rx_pos.z};
 
     int fc1_weights_size = hidden_size * input_size;
     int fc1_bias_size = hidden_size;
@@ -38,105 +39,40 @@ __device__ glm::vec3 computeSignalFromMLP(
     int offset4 = num_gaussians * fc1_weights_size + num_gaussians * fc1_bias_size + num_gaussians * fc2_weights_size + idx * fc2_bias_size;
 
     const float* fc1_weights = &mlp_params[offset1];
-    const float* fc1_bias = &mlp_params[offset2];
+    const float* fc1_bias    = &mlp_params[offset2];
     const float* fc2_weights = &mlp_params[offset3];
-    const float* fc2_bias = &mlp_params[offset4];
+    const float* fc2_bias    = &mlp_params[offset4];
 
     glm::vec3 diff = tx_pos - means[idx];
     float d = glm::length(diff);
     float log_d = logf(d + 1e-6f);
 
+    // Hidden layer with leaky ReLU
     float hidden[hidden_size] = {0.0f};
     for (int i = 0; i < hidden_size; ++i) {
-        float sum = 0.0f;
+        float sum = fc1_bias[i];
         for (int j = 0; j < input_size; ++j) {
             sum += fc1_weights[i * input_size + j] * input[j];
         }
-        hidden[i] = fmaxf(sum + fc1_bias[i], 0.0f);  // ReLU
+        hidden[i] = (sum > 0.0f) ? sum : (leaky_slope * sum);
     }
 
+    // Output: linear pre-activation (NO output ReLU), then sigmoid with log-distance bias.
+    // This preserves the (0, 1) output range the rasterizer expects, while letting
+    // the network reach the lower half of the sigmoid (which the prior ReLU blocked).
     float output[output_size] = {0.0f};
     for (int i = 0; i < output_size; ++i) {
-        float sum = 0.0f;
+        float sum = fc2_bias[i];
         for (int j = 0; j < hidden_size; ++j) {
             sum += fc2_weights[i * hidden_size + j] * hidden[j];
         }
-        sum += fc2_bias[i];
-
-        float relu_out = fmaxf(sum, 0.0f); // ✅ ReLU before sigmoid
-        float attenuated = relu_out - log_d;
+        float attenuated = sum - log_d;                      // no ReLU here
         float sigmoid_val = 1.0f / (1.0f + expf(-attenuated));
         output[i] = sigmoid_val;
     }
 
     return glm::vec3(output[0], output[1], 0.0f);
 }
-
-
-// __device__ glm::vec3 computeSignalFromMLP(int idx, int num_gaussians, const float* mlp_params, const glm::vec3* means, glm::vec3 rx_pos, glm::vec3 tx_pos)
-// {
-//     // constants
-//     const int input_size = 5;
-//     const int hidden_size = 16;
-//     const int output_size = 2;
-
-//     // get direction
-//     glm::vec3 pos = means[idx];
-// 	glm::vec3 dir = pos - rx_pos;
-// 	dir = dir / glm::length(dir);
-
-//     // Compute azimuth and elevation from direction vector
-//     float azimuth = atan2(dir.y, dir.x);  // Azimuth angle (in radians)
-//     float elevation = acos(dir.z);        // Elevation angle (in radians)
-
-//     // The input to the MLP is [dir.x, dir.y, dir.z, azimuth, elevation]
-//     float input[input_size] = {tx_pos.x, tx_pos.y, tx_pos.z, azimuth, elevation};
-
-//     // compute the size of each section in the flattened tensor
-//     int fc1_weights_size = hidden_size * input_size;
-//     int fc1_bias_size = hidden_size;
-//     int fc2_weights_size = output_size * hidden_size;
-//     int fc2_bias_size = output_size;
-
-//     // compute the offsets based on idx and num_gaussians
-//     int offset1 = idx * fc1_weights_size;  // for fc1_weights
-//     int offset2 = num_gaussians *  fc1_weights_size + idx * fc1_bias_size;  // for fc1_bias
-//     int offset3 = num_gaussians * fc1_weights_size + num_gaussians * fc1_bias_size + idx * fc2_weights_size;  // for fc2_weights
-//     int offset4 = num_gaussians * fc1_weights_size + num_gaussians * fc1_bias_size + num_gaussians * fc2_weights_size + idx * fc2_bias_size;  // for fc2_bias
-
-//     // access weights and biases
-//     const float* fc1_weights = &mlp_params[offset1];
-//     const float* fc1_bias = &mlp_params[offset2];
-//     const float* fc2_weights = &mlp_params[offset3];
-//     const float* fc2_bias = &mlp_params[offset4];
-
-//     // forward pass - First layer (Input to Hidden)
-//     float hidden[hidden_size] = {0.0f};
-//     for (int i = 0; i < hidden_size; ++i)
-//     {
-//         float sum = 0.0f;
-//         for (int j = 0; j < input_size; ++j)
-//         {
-//             sum += fc1_weights[i * input_size + j] * input[j];
-//         }
-//         hidden[i] = fmaxf(sum + fc1_bias[i], 0.0f); // ReLU activation
-//     }
-
-//     // forward pass - Second layer (Hidden to Output)
-//     float output[output_size] = {0.0f};
-//     for (int i = 0; i < output_size; ++i)
-//     {
-//         float sum = 0.0f;
-//         for (int j = 0; j < hidden_size; ++j)
-//         {
-//             sum += fc2_weights[i * hidden_size + j] * hidden[j];
-//         }
-//         output[i] = 1.0f / (1.0f + expf(-(sum + fc2_bias[i]))); // Sigmoid activation
-//     }
-
-//     // return result as glm::vec3 (padding the last component with 0.0f)
-//     return glm::vec3(output[0], output[1], 0.0f);
-// }
 
 
 __device__ float3 computeCov2D(const float3& mean, const int width, const int height, const float* cov3D, const float* viewmatrix)
@@ -368,7 +304,7 @@ __global__ void preprocessCUDA(int P,
     float lambda1 = mid + sqrtf(max(0.1f, mid * mid - det));
     float lambda2 = mid - sqrtf(max(0.1f, mid * mid - det));
     float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
-    float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y - 1,2 * H) };
+    float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 
     uint2 rect_min, rect_max;
     getRect(point_image, my_radius, rect_min, rect_max, grid);

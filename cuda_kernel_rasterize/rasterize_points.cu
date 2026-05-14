@@ -21,11 +21,6 @@
 #include <string>
 #include <functional>
 
-// torch::Tensor RasterizeGaussiansCUDA(torch::Tensor a, torch::Tensor b) {
-//     return a + b;  // Simple tensor addition (this is just a placeholder)
-// }
-
-
 std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     auto lambda = [&t](size_t N) {
         t.resize_({(long long)N});
@@ -63,8 +58,6 @@ RasterizeGaussiansCUDA(
 
     auto int_opts = means3D.options().dtype(torch::kInt32);
     auto float_opts = means3D.options().dtype(torch::kFloat32);
-
-    //std::cout << "Inside CUDA rasterizer" << std::endl;
 
     torch::Tensor out_signal_real = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
     torch::Tensor out_signal_imag = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);

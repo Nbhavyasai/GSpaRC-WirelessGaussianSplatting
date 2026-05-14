@@ -27,6 +27,7 @@ from tqdm import tqdm  # Import tqdm
 import sys  # Import sys for stdout/stderr redirection
 import glob  # Import glob for finding checkpoints
 os.environ['TENSORBOARD_PORT'] = '6007'
+import csv
 
 from preprocess_data import *
 from initialization import *
@@ -41,8 +42,14 @@ try:
 except:
     FUSED_SSIM_AVAILABLE = False
 
+def circular_phase_l1_loss(phase_pred_norm, phase_gt_norm):
+    """
+    phase_pred_norm, phase_gt_norm: tensors in [0,1], e.g. shape (B, H, W)
+    """
+    diff = torch.abs(phase_pred_norm - phase_gt_norm)
+    circ_diff = torch.minimum(diff, 1.0 - diff)
+    return circ_diff.mean()   # L1 circular loss
 
-# Add at the beginning of the file, after imports
 def create_run_folder():
     """Create a new folder for this run with timestamp"""
     today_date = time.strftime("%m_%d") # Get current date as MM_DD
@@ -76,7 +83,6 @@ def calculate_psnr(pred, target):
     return psnr
 
 
-# Add after other utility functions
 def calculate_rssi(signal):
     """Calculate RSSI in dBm from signal strength"""
     # Convert signal power to dBm
@@ -86,13 +92,11 @@ def calculate_rssi(signal):
     return rssi
 
 
-# Add after other utility functions
 def calculate_mse(pred, target):
     """Calculate Mean Square Error"""
     return torch.mean((pred - target) ** 2)
 
 
-# Add new function for MAE
 def calculate_mae(pred, target):
     """Calculate Mean Absolute Error"""
     return torch.mean(torch.abs(pred - target))
@@ -164,6 +168,7 @@ class WGS_RFSPM_Runner:
         ## Logger
         log_filename = "logger.log"
         log_savepath = os.path.join(self.logdir, self.expname, log_filename)
+        os.makedirs(os.path.dirname(log_savepath), exist_ok=True)
         self.logger = logger_config(log_savepath=log_savepath, logging_name='wgs_rfspm')
         self.logger.info("expname:%s, datadir:%s, logdir:%s", self.expname, self.datadir, self.logdir)
         self.logger.info(f"Run folder: {self.run_folder}")  # Log the run folder path
@@ -201,10 +206,11 @@ class WGS_RFSPM_Runner:
         print(f"Train set size: {len(self.train_set)}, Test set size: {len(self.test_set)}")
 
         # fixing the dimensions of scene for now
-        self.xyz_min = np.array([-30.0, -30.0, 0.0])
-        self.xyz_max = np.array([30.0, 30.0, 30.0])
+        self.xyz_min = np.array([-7.0, -4.0, 0.0])
+        self.xyz_max = np.array([7.0, 6.0, 4.0])
+        self.scene_extent = np.linalg.norm(self.xyz_max - self.xyz_min)
 
-        # # optimization parameters instance
+        # Optimization parameters instance
         self.optim_params = OptimizationParams()
 
         # Get optimizer parameters from kwargs
@@ -232,10 +238,16 @@ class WGS_RFSPM_Runner:
             'emission_fc2_bias': gaussian_model._emission_mlps.fc2_bias,       # Match load_checkpoint keys
         }
         
+        # Save confidence MLP state dict separately (it's an nn.Module)
+        confidence_state = None
+        if gaussian_model._confidence_mlp is not None:
+            confidence_state = gaussian_model._confidence_mlp.state_dict()
+
         save_dict = {
             'iteration': iteration,
             'model_state_dict': model_state,
             'optimizer_state_dict': gaussian_model.optimizer.state_dict(),
+            'confidence_mlp_state_dict': confidence_state,
         }
         
         torch.save(save_dict, checkpoint_path)
@@ -272,6 +284,19 @@ class WGS_RFSPM_Runner:
         gaussian_model._emission_mlps.fc2_weights = torch.nn.Parameter(model_state['emission_fc2_weights'].to(self.devices))
         gaussian_model._emission_mlps.fc2_bias = torch.nn.Parameter(model_state['emission_fc2_bias'].to(self.devices))
 
+        # Load confidence MLP state if available
+        confidence_state = checkpoint.get('confidence_mlp_state_dict', None)
+        if confidence_state is not None:
+            hidden_size = getattr(self.optim_params, 'confidence_hidden_size', 32)
+            if gaussian_model._confidence_mlp is None:
+                from gaussian import ConfidenceMLP
+                gaussian_model._confidence_mlp = ConfidenceMLP(hidden_size=hidden_size)
+            gaussian_model._confidence_mlp.load_state_dict(confidence_state)
+            gaussian_model._confidence_mlp.to(self.devices)
+            print("Loaded confidence MLP state from checkpoint.")
+        else:
+            print("No confidence MLP state found in checkpoint (older checkpoint?).")
+
         # Load optimizer state
         # Important: Optimizer must be initialized *before* loading state_dict
         # training_setup should handle this.
@@ -284,23 +309,6 @@ class WGS_RFSPM_Runner:
         iteration = checkpoint['iteration']
         print(f"Loaded checkpoint from iteration {iteration} at {checkpoint_path}")
         return iteration
-
-    def _find_latest_checkpoint(self):
-        """Return the path to the latest checkpoint in self.checkpoint_dir, or None."""
-        if not (self.checkpoint_interval > 0 and os.path.exists(self.checkpoint_dir)):
-            return None
-        files = glob.glob(os.path.join(self.checkpoint_dir, "checkpoint_iter_*.pth"))
-        if not files:
-            return None
-        iters = []
-        for f in files:
-            try:
-                iters.append(int(os.path.splitext(os.path.basename(f))[0].split('_')[-1]))
-            except Exception:
-                iters.append(-1)
-        if max(iters) < 0:
-            return None
-        return files[int(np.argmax(iters))]
 
     def train(self):
         """train the model"""
@@ -319,8 +327,7 @@ class WGS_RFSPM_Runner:
         print("-" * 50 + "\n")
 
         gaussian_model.initialize_gaussians(points)
-
-        gaussian_model.training_setup(self.optim_params)
+        gaussian_model.training_setup(self.optim_params, spatial_lr_scale=self.scene_extent)
 
         # Print the number of initial Gaussians
         initial_gaussians = gaussian_model.get_centre.size(0)
@@ -411,15 +418,22 @@ class WGS_RFSPM_Runner:
             gt_signal_real = wireless_data.spectrum_real.cuda()
             
             loss_l1 = l1_loss(rendered_signal_real, gt_signal_real)
-            # loss_ssim = ssim(rendered_signal_real, gt_signal_real)
-            # loss = (1-self.optim_params.lambda1) * loss_l1 + self.optim_params.lambda1 * loss_ssim
 
             if FUSED_SSIM_AVAILABLE:
                 ssim_value = fused_ssim(rendered_signal_real.unsqueeze(0).unsqueeze(0), gt_signal_real.unsqueeze(0).unsqueeze(0))
             else:
                 ssim_value = ssim(rendered_signal_real, gt_signal_real)
 
-            loss = (1.0 - self.optim_params.lambda_ssim) * loss_l1 + self.optim_params.lambda_ssim * (1.0 - ssim_value)
+            reconstruction_loss = (1.0 - self.optim_params.lambda1) * loss_l1 + self.optim_params.lambda1 * (1.0 - ssim_value)
+
+            # ── DUSt3R-style confidence-weighted loss (Eq. 4) ──
+            # L_conf = C * L_reconstruction - alpha * log(C)
+            # C > 1 by construction (1 + exp(raw)), so log(C) > 0.
+            # The network can down-weight hard samples (low C) but pays a
+            # penalty (-alpha * log C becomes more negative → larger loss).
+            confidence = rendered_pkg["confidence"]  # scalar, > 1
+            alpha = self.optim_params.confidence_alpha
+            loss = confidence * reconstruction_loss - alpha * torch.log(confidence)
 
             # Perform backpropagation to compute gradients
             loss.backward()
@@ -432,8 +446,10 @@ class WGS_RFSPM_Runner:
 
                 # Log loss to TensorBoard and update progress bar
                 self.writer.add_scalar('Loss/train', loss.item(), iteration)
+                self.writer.add_scalar('Confidence/train_value', confidence.item(), iteration)
+                self.writer.add_scalar('Loss/train_reconstruction', reconstruction_loss.item(), iteration)
                 if iteration % 10 == 0:
-                    progress_bar.set_postfix({"Loss": f"{loss:.{7}f}"})
+                    progress_bar.set_postfix({"Loss": f"{loss.item():.7f}", "Conf": f"{confidence.item():.3f}"})
                     progress_bar.update(10)
                 if iteration == self.optim_params.iterations:
                     progress_bar.close()
@@ -446,9 +462,9 @@ class WGS_RFSPM_Runner:
                     ssim_values = []
                     rssi_diff_values = []
                     mse_values = []
+                    confidence_values = []
 
                     for test_data in self.test_set.get_data():
-                        # ... (rendering test data) ...
                         rendered_pkg = render(test_data, gaussian_model)
                         rendered_signal_real, _ = rendered_pkg['render']
                         gt_signal_real = test_data.spectrum_real.cuda()
@@ -457,6 +473,7 @@ class WGS_RFSPM_Runner:
                         psnr_values.append(calculate_psnr(rendered_signal_real, gt_signal_real).item())
                         rssi_diff_values.append((calculate_rssi(rendered_signal_real) - calculate_rssi(gt_signal_real)).item())
                         mse_values.append(calculate_mse(rendered_signal_real, gt_signal_real).item())
+                        confidence_values.append(rendered_pkg["confidence"].item())
 
                         if FUSED_SSIM_AVAILABLE:
                             ssim_value = fused_ssim(rendered_signal_real.unsqueeze(0).unsqueeze(0),
@@ -467,7 +484,7 @@ class WGS_RFSPM_Runner:
 
                         # Calculate test loss for this sample
                         loss_l1_test = l1_loss(rendered_signal_real, gt_signal_real)
-                        loss_test = (1.0 - self.optim_params.lambda_ssim) * loss_l1_test + self.optim_params.lambda_ssim * (1.0 - ssim_value)
+                        loss_test = (1.0 - self.optim_params.lambda1) * loss_l1_test + self.optim_params.lambda1 * (1.0 - ssim_value)
                         total_test_loss += loss_test.item()
                         total_test_samples += 1
 
@@ -476,37 +493,77 @@ class WGS_RFSPM_Runner:
                     self.writer.add_scalar('Loss/test', avg_test_loss, iteration)
 
                     # Log distributions using the helper function
-                    # log_metric_distribution(self.writer, 'PSNR', psnr_values, iteration, unit=' (dB)')
+                    log_metric_distribution(self.writer, 'PSNR', psnr_values, iteration, unit=' (dB)')
                     log_metric_distribution(self.writer, 'SSIM', ssim_values, iteration)
-                    # log_metric_distribution(self.writer, 'RSSI_Difference', rssi_diff_values, iteration, unit=' (dBm)')
-                    # log_metric_distribution(self.writer, 'MSE', mse_values, iteration)
+                    log_metric_distribution(self.writer, 'RSSI_Difference', rssi_diff_values, iteration, unit=' (dBm)')
+                    log_metric_distribution(self.writer, 'MSE', mse_values, iteration)
+                    log_metric_distribution(self.writer, 'Confidence_test', confidence_values, iteration)
 
-                # if iteration < self.optim_params.densify_until_iter:
-                #     # Keep track of max radii in image-space for pruning
-                #     gaussian_model.max_radii2D[visibility_filter] = torch.max(gaussian_model.max_radii2D[visibility_filter], radii[visibility_filter])
-                #     gaussian_model.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # ── Densification & pruning ──
+                # Precompute scene bounds tensors (with margin) for OOB pruning and clamping.
+                bounds_margin = 4.0
+                scene_min_t = torch.tensor(self.xyz_min - bounds_margin, device='cuda', dtype=torch.float32)
+                scene_max_t = torch.tensor(self.xyz_max + bounds_margin, device='cuda', dtype=torch.float32)
 
-                #     if iteration > self.optim_params.densify_from_iter and iteration % self.optim_params.densification_interval == 0:
-                #         print(f"Radii tensor before: {radii.shape}, {radii.device}")
-                #         size_threshold = 20 if iteration > self.optim_params.opacity_reset_interval else None
-                #         gaussian_model.densify_and_prune(self.optim_params.densify_grad_threshold, 0.01, 8.0, size_threshold, radii)
-                #         # print(f"Radii tensor after: {radii.shape}, {radii.device}")
-                #         new_num_gauss = gaussian_model.get_num_gaussians
-                #         print(f"densification and pruning complete")
-                #         # Update TensorBoard with counts specifically for densification/pruning
-                #         self.writer.add_scalar('Gaussians/count', new_num_gauss, iteration)
+                if iteration < self.optim_params.densify_until_iter:
+                    # Keep track of max screen-space radius per Gaussian (for big-blob pruning)
+                    if visibility_filter.numel() > 0:
+                        vis_idx = visibility_filter.squeeze(-1) if visibility_filter.dim() > 1 else visibility_filter
+                        gaussian_model.max_radii2D[vis_idx] = torch.max(
+                            gaussian_model.max_radii2D[vis_idx], radii[vis_idx].float()
+                        )
+                        gaussian_model.add_densification_stats(viewspace_point_tensor, vis_idx)
+                        if iteration % 100 == 0:
+                            self.writer.add_scalar('Densify/visible_count', vis_idx.sum().item(), iteration)
+                            self.writer.add_scalar('Densify/grad_mean', viewspace_point_tensor.grad[vis_idx, :2].abs().mean().item(), iteration)
 
-                #     if iteration % self.optim_params.opacity_reset_interval == 0:
-                #         gaussian_model.reset_opacity()
+                    if (iteration > self.optim_params.densify_from_iter
+                            and iteration % self.optim_params.densification_interval == 0):
+                        size_threshold = 20 if iteration > self.optim_params.opacity_reset_interval else None
+                        gaussian_model.densify_and_prune(
+                            max_grad      = self.optim_params.densify_grad_threshold,
+                            min_opacity   = 0.01,
+                            extent        = self.scene_extent,
+                            max_screen_size = size_threshold,
+                            radii         = radii,
+                            scene_min     = scene_min_t,
+                            scene_max     = scene_max_t,
+                        )
+                        self.writer.add_scalar('Gaussians/count', gaussian_model.get_num_gaussians, iteration)
 
-                # Update optimizer step logic
-                if iteration < self.optim_params.iterations:
-                    gaussian_model.optimizer.step()
-                    gaussian_model.optimizer.zero_grad(set_to_none=True)
+                    if (iteration % self.optim_params.opacity_reset_interval == 0
+                            and iteration > 0
+                            and iteration < self.optim_params.densify_until_iter):
+                        gaussian_model.reset_opacity()
 
-                    # Check Gaussian centers for NaN after optimizer step
-                    if torch.isnan(gaussian_model.get_centre).any():
-                        raise RuntimeError("NaN detected in Gaussian centers after optimizer step.")
+                # ── Post-densification pruning (runs even after densify_until_iter) ──
+                # Periodically kill giant / escaped / near-transparent Gaussians
+                # so they can't grow unchecked in the pure-optimization phase.
+                elif iteration % 10000 == 0:
+                    with torch.no_grad():
+                        prune_mask = (gaussian_model.get_opacity < 0.001).squeeze()
+                        big_ws = gaussian_model.get_scaling.max(dim=1).values > 0.1 * self.scene_extent
+                        centres = gaussian_model.get_centre.detach()
+                        oob = (centres < scene_min_t).any(dim=1) | (centres > scene_max_t).any(dim=1)
+                        prune_mask = prune_mask | big_ws | oob
+                        if prune_mask.any():
+                            gaussian_model.tmp_radii = radii
+                            gaussian_model.prune_points(prune_mask)
+                            gaussian_model.tmp_radii = None
+                            self.writer.add_scalar('Gaussians/count', gaussian_model.get_num_gaussians, iteration)
+
+                # Optimizer step
+                gaussian_model.optimizer.step()
+                gaussian_model.optimizer.zero_grad(set_to_none=True)
+
+                # Clamp Gaussian centres to scene bounding box (with margin)
+                # to prevent them from escaping to distant positions.
+                with torch.no_grad():
+                    gaussian_model._centre.data.clamp_(min=scene_min_t, max=scene_max_t)
+
+                # Check Gaussian centers for NaN after optimizer step
+                if torch.isnan(gaussian_model.get_centre).any():
+                    raise RuntimeError("NaN detected in Gaussian centers after optimizer step.")
                 
                 # Save checkpoint
                 if self.checkpoint_interval > 0 and iteration % self.checkpoint_interval == 0:
@@ -529,133 +586,362 @@ class WGS_RFSPM_Runner:
             plot_final_gaussians(self.xyz_min, self.xyz_max, gaussian_model,
                                save_path=os.path.join(self.run_folder, "final_gaussians.png"))
 
-        
-        # --- Post-Training Evaluation ---
-        print("\n--- Post-Training Evaluation ---")
-        choice = getattr(self, "eval_after_train", "model")
-        if choice == 'off':
-            print("Skipping evaluation after training (eval_after_train=off).")
-        elif choice == 'model':
-            # Evaluate the model currently in memory
-            self.evaluate(gaussian_model=gaussian_model, tag="after_train_model")
-        elif choice == 'checkpoint':
-            latest = self._find_latest_checkpoint()
-            if latest:
-                print(f"Evaluating using latest checkpoint: {latest}")
-                self.evaluate(checkpoint_path=latest, tag="after_train_ckpt")
+        # --- Automatically run evaluation after training ---
+        print("\n--- Starting Post-Training Evaluation ---")
+        latest_checkpoint_path = None
+        if self.checkpoint_interval > 0 and os.path.exists(self.checkpoint_dir):
+            # Find the latest checkpoint
+            checkpoint_files = glob.glob(os.path.join(self.checkpoint_dir, "checkpoint_iter_*.pth"))
+            if checkpoint_files:
+                iterations = [int(f.split('_')[-1].split('.')[0]) for f in checkpoint_files]
+                latest_iteration = max(iterations)
+                latest_checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint_iter_{latest_iteration}.pth")
+                print(f"Found latest checkpoint: {latest_checkpoint_path}")
             else:
-                print("No checkpoint found; falling back to in-memory model.")
-                self.evaluate(gaussian_model=gaussian_model, tag="after_train_model")
+                print("No checkpoint files found in the checkpoint directory.")
+        else:
+            print("Checkpoint saving was disabled or directory doesn't exist. Skipping evaluation.")
+
+        if latest_checkpoint_path:
+            # Run evaluation using the latest checkpoint
+            self.evaluate(latest_checkpoint_path)
+        else:
+            print("Could not find a checkpoint to load for evaluation.")
         print("--- Post-Training Evaluation Finished ---")
 
 
-    def evaluate(self, checkpoint_path=None, gaussian_model=None, tag="eval"):
-        """
-        Evaluate either:
-        - an in-memory `gaussian_model` (use right after training), OR
-        - a model loaded from `checkpoint_path`.
+    def evaluate(self, checkpoint_path):
+        """Load a checkpoint and evaluate the model on the test set."""
+        print(f"Starting evaluation using checkpoint: {checkpoint_path}")
 
-        If both are provided, `gaussian_model` takes precedence.
-        """
-        use_ckpt = (gaussian_model is None)
+        # Initialize Gaussian Model
+        gaussian_model = GaussianModel(logger=None, debug=False)
 
-        if use_ckpt and checkpoint_path is None:
-            raise ValueError("evaluate() needs either `gaussian_model` or `checkpoint_path`")
+        # Load checkpoint FIRST
+        loaded_iteration = self.load_checkpoint(gaussian_model, checkpoint_path)
 
-        if use_ckpt:
-            print(f"Starting evaluation from checkpoint: {checkpoint_path}")
-            gaussian_model = GaussianModel(logger=None, debug=False)
-            loaded_iteration = self.load_checkpoint(gaussian_model, checkpoint_path)
-            # If your renderer requires buffers set by training_setup(), keep this call:
-            gaussian_model.training_setup(self.optim_params)
-            iter_tag = loaded_iteration
-        else:
-            print("Starting evaluation using the in-memory model (no checkpoint load).")
-            # Reasonable step for TensorBoard
-            iter_tag = getattr(self.optim_params, "iterations", 0)
+        # Setup optimizer after loading
+        gaussian_model.training_setup(self.optim_params, spatial_lr_scale=self.scene_extent)
 
-        # Create evaluation directory, allow unique tag names
-        eval_dir_name = "evaluation" if tag is None else f"evaluation_{tag}"
-        eval_plots_folder = os.path.join(self.run_folder, eval_dir_name)
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.devices, weights_only=False)
+            gaussian_model.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("Successfully reloaded optimizer state after setup.")
+        except Exception as e:
+            print(f"Warning: Could not reload optimizer state after setup: {e}. Optimizer will use initial state.")
+
+        # Create evaluation directory
+        eval_plots_folder = os.path.join(self.run_folder, "evaluation")
         os.makedirs(eval_plots_folder, exist_ok=True)
         print(f"Saving evaluation plots to: {eval_plots_folder}")
 
-        # --- Evaluation loop (unchanged except minor prints/vars) ---
-        total_test_loss = 0.0
-        total_test_samples = 0
-        psnr_values, ssim_values, rssi_diff_values, mae_values, eval_render_times = [], [], [], [], []
+        def evaluate_split(split_name, dataset_obj):
+            """
+            Evaluate a given dataset split ('test' or 'train').
+            Returns summary metrics and per-sample rows.
+            """
+            print(f"\n--- Evaluating {split_name.upper()} split ---")
 
-        test_data_list = self.test_set.get_data()
+            # Create subfolder for per-sample spectrum plots (same style as training plots)
+            split_plots_folder = os.path.join(eval_plots_folder, f"{split_name}_plots")
+            os.makedirs(split_plots_folder, exist_ok=True)
+            print(f"Saving per-sample {split_name} spectrum plots to: {split_plots_folder}")
 
-        with torch.no_grad():
-            progress_bar_eval = tqdm(enumerate(test_data_list), total=len(test_data_list), desc="Evaluating")
-            for idx, test_data in progress_bar_eval:
-                t0 = time.time()
-                rendered_pkg = render(test_data, gaussian_model)
-                t1 = time.time()
-                current_render_time_ms = (t1 - t0) * 1000.0
-                eval_render_times.append(t1 - t0)
+            total_loss = 0.0
+            total_samples = 0
 
-                rendered_signal_real, _ = rendered_pkg['render']
-                gt_signal_real = test_data.spectrum_real.cuda()
+            psnr_values = []
+            ssim_values = []
+            rssi_diff_values = []
+            mae_values = []
+            render_times = []
+            confidence_values = []
 
-                if (idx % 2 == 0):
-                    output_img = rendered_signal_real.detach().cpu().numpy()
-                    gt_img = test_data.spectrum_real.cpu().numpy()
+            per_sample_rows = []
+            all_rendered = []
+
+            data_list = dataset_obj.get_data()
+
+            with torch.no_grad():
+                progress_bar = tqdm(
+                    enumerate(data_list),
+                    total=len(data_list),
+                    desc=f"Evaluating {split_name}"
+                )
+
+                for idx, sample_data in progress_bar:
+                    render_start = time.time()
+                    rendered_pkg = render(sample_data, gaussian_model)
+                    render_end = time.time()
+
+                    current_render_time_ms = (render_end - render_start) * 1000.0
+                    render_times.append(render_end - render_start)
+
+                    rendered_signal_real, _ = rendered_pkg['render']
+                    gt_signal_real = sample_data.spectrum_real.cuda()
+
+                    # Metrics
+                    psnr_val = calculate_psnr(rendered_signal_real, gt_signal_real).item()
+                    rssi_diff_val = (calculate_rssi(rendered_signal_real) - calculate_rssi(gt_signal_real)).item()
+                    mae_val = calculate_mae(rendered_signal_real, gt_signal_real).item()
+                    ssim_val = ssim(rendered_signal_real, gt_signal_real).item()
+                    conf_val = rendered_pkg["confidence"].item()
+
+                    # Loss
+                    loss_l1 = l1_loss(rendered_signal_real, gt_signal_real)
+                    loss_val = (1.0 - self.optim_params.lambda1) * loss_l1 + self.optim_params.lambda1 * (1.0 - ssim_val)
+
+                    total_loss += loss_val.item()
+                    total_samples += 1
+
+                    psnr_values.append(psnr_val)
+                    ssim_values.append(ssim_val)
+                    rssi_diff_values.append(rssi_diff_val)
+                    mae_values.append(mae_val)
+                    confidence_values.append(conf_val)
+
+                    rendered_signal_np = rendered_signal_real.detach().cpu().numpy()
+                    all_rendered.append(rendered_signal_np.copy())
+
+                    sample_id = dataset_obj.dataset_index[idx]
+
+                    # ── Save side-by-side GT vs Predicted spectrum plot (same style as training) ──
+                    gt_img = gt_signal_real.detach().cpu().numpy()
+                    output_img = rendered_signal_np
+
                     plt.figure(figsize=(12, 5))
-                    plt.subplot(1, 2, 1); plt.imshow(gt_img, cmap='gray'); plt.title('Ground Truth Spectrum'); plt.axis('off')
-                    plt.subplot(1, 2, 2); plt.imshow(output_img, cmap='gray'); plt.title('Predicted Spectrum'); plt.axis('off')
+
+                    plt.subplot(1, 2, 1)
+                    plt.imshow(gt_img, cmap='gray')
+                    plt.title('Ground Truth Spectrum')
+                    plt.axis('off')
+
+                    plt.subplot(1, 2, 2)
+                    plt.imshow(output_img, cmap='gray')
+                    plt.title('Predicted Spectrum')
+                    plt.axis('off')
+
+                    plt.suptitle(
+                        f'{split_name.upper()} | idx={idx} id={sample_id} | '
+                        f'PSNR={psnr_val:.2f}  SSIM={ssim_val:.3f}  MAE={mae_val:.4f}  Conf={conf_val:.3f}',
+                        fontsize=11
+                    )
                     plt.tight_layout()
-                    plt.savefig(os.path.join(eval_plots_folder, f"{idx}.png"))
+
+                    sample_plot_path = os.path.join(
+                        split_plots_folder,
+                        f"spectrum_{split_name}_idx{idx}_id{sample_id}.png"
+                    )
+                    plt.savefig(sample_plot_path, dpi=120)
                     plt.close()
 
-                psnr_val = calculate_psnr(rendered_signal_real, gt_signal_real).item()
-                rssi_diff_val = (calculate_rssi(rendered_signal_real) - calculate_rssi(gt_signal_real)).item()
-                mae_val = calculate_mae(rendered_signal_real, gt_signal_real).item()
-                ssim_val = ssim(rendered_signal_real, gt_signal_real).item()
+                    per_sample_rows.append({
+                        "sample_idx": idx,
+                        "sample_id": sample_id,
+                        "split": split_name,
+                        "psnr": psnr_val,
+                        "ssim": ssim_val,
+                        "mae": mae_val,
+                        "rssi_diff": rssi_diff_val,
+                        "render_time_ms": current_render_time_ms,
+                        "loss": loss_val.item(),
+                        "confidence": conf_val,
+                    })
 
-                psnr_values.append(psnr_val)
-                ssim_values.append(ssim_val)
-                rssi_diff_values.append(rssi_diff_val)
-                mae_values.append(mae_val)
+                    # Print to tqdm bar
+                    progress_bar.set_postfix({
+                        "SampleIdx": idx,
+                        "ID": sample_id,
+                        "PSNR": f"{psnr_val:.2f}",
+                        "SSIM": f"{ssim_val:.3f}",
+                        "MAE": f"{mae_val:.4f}",
+                        "Conf": f"{conf_val:.3f}",
+                        "RenderTime(ms)": f"{current_render_time_ms:.2f}"
+                    })
 
-                loss_l1_test = l1_loss(rendered_signal_real, gt_signal_real)
-                loss_test = (1.0 - self.optim_params.lambda_ssim) * loss_l1_test + self.optim_params.lambda_ssim * (1.0 - ssim_val)
-                total_test_loss += loss_test.item()
-                total_test_samples += 1
+                    # Also print an explicit log line for parsing later
+                    print(
+                        f"[{split_name.upper()}] "
+                        f"SampleIdx={idx} "
+                        f"ID={sample_id} "
+                        f"PSNR={psnr_val:.4f} "
+                        f"SSIM={ssim_val:.6f} "
+                        f"MAE={mae_val:.6f} "
+                        f"RSSI_DIFF={rssi_diff_val:.6f} "
+                        f"Confidence={conf_val:.6f} "
+                        f"RenderTimeMS={current_render_time_ms:.4f} "
+                        f"LOSS={loss_val.item():.6f}"
+                    )
 
-                progress_bar_eval.set_postfix({
-                    "SampleIdx": idx,
-                    "PSNR": f"{psnr_val:.2f}",
-                    "SSIM": f"{ssim_val:.3f}",
-                    "MAE": f"{mae_val:.4f}",
-                    "RenderTime(ms)": f"{current_render_time_ms:.2f}"
-                })
+            # Save rendered outputs
+            all_rendered_np = np.stack(all_rendered, axis=0)
+            rendered_path = os.path.join(eval_plots_folder, f"gs_output_real_{split_name}.npy")
+            np.save(rendered_path, all_rendered_np)
+            print(f"Saved {split_name} rendered outputs to: {rendered_path} with shape {all_rendered_np.shape}")
 
-        avg_test_loss = total_test_loss / total_test_samples if total_test_samples > 0 else 0
-        avg_psnr = float(np.mean(psnr_values)) if psnr_values else 0.0
-        avg_ssim = float(np.mean(ssim_values)) if ssim_values else 0.0
-        avg_rssi_diff = float(np.mean(rssi_diff_values)) if rssi_diff_values else 0.0
-        avg_mae = float(np.mean(mae_values)) if mae_values else 0.0
-        avg_render_time = (float(np.mean(eval_render_times)) * 1000.0) if eval_render_times else 0.0
+            # Save per-sample CSV
+            metrics_csv_path = os.path.join(eval_plots_folder, f"per_sample_metrics_{split_name}.csv")
+            with open(metrics_csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "sample_idx",
+                    "sample_id",
+                    "split",
+                    "psnr",
+                    "ssim",
+                    "mae",
+                    "rssi_diff",
+                    "render_time_ms",
+                    "loss",
+                    "confidence",
+                ])
+                for row in per_sample_rows:
+                    writer.writerow([
+                        row["sample_idx"],
+                        row["sample_id"],
+                        row["split"],
+                        row["psnr"],
+                        row["ssim"],
+                        row["mae"],
+                        row["rssi_diff"],
+                        row["render_time_ms"],
+                        row["loss"],
+                        row["confidence"],
+                    ])
+            print(f"Saved per-sample {split_name} metrics to: {metrics_csv_path}")
 
-        print("\n--- Evaluation Results ---")
-        print(f"Eval source: {'checkpoint' if use_ckpt else 'in-memory model'}")
-        print(f"Eval tag: {tag}")
-        print(f"Average Test Loss: {avg_test_loss:.7f}")
-        print(f"Average PSNR: {avg_psnr:.2f} dB")
-        print(f"Average SSIM: {avg_ssim:.4f}")
-        print(f"Average RSSI Difference: {avg_rssi_diff:.2f} dBm")
-        print(f"Average MAE: {avg_mae:.7f}")
-        print(f"Average Render Time: {avg_render_time:.2f} ms")
-        print("--------------------------\n")
+            # ── Confidence vs Loss correlation plot ──
+            if confidence_values and len(confidence_values) > 1:
+                conf_arr = np.array(confidence_values)
+                loss_arr = np.array([r["loss"] for r in per_sample_rows])
+                mae_arr  = np.array(mae_values)
+                sample_ids = [r["sample_id"] for r in per_sample_rows]
 
-        self.writer.add_scalar('Loss/eval', avg_test_loss, iter_tag)
-        # log_metric_distribution(self.writer, 'PSNR_eval', psnr_values, iter_tag, unit=' (dB)')
-        log_metric_distribution(self.writer, 'SSIM_eval', ssim_values, iter_tag)
-        # log_metric_distribution(self.writer, 'RSSI_Difference_eval', rssi_diff_values, iter_tag, unit=' (dBm)')
-        # log_metric_distribution(self.writer, 'MAE_eval', mae_values, iter_tag)
-        self.writer.add_scalar('Time/avg_render_eval_ms', avg_render_time, iter_tag)
+                # --- Plot 1: Scatter plot with trend line ---
+                fig, ax1 = plt.subplots(figsize=(10, 7))
+
+                scatter = ax1.scatter(conf_arr, loss_arr, c=mae_arr, cmap='RdYlGn_r',
+                                      alpha=0.7, edgecolors='k', linewidths=0.3, s=40)
+                cbar = plt.colorbar(scatter, ax=ax1, pad=0.02)
+                cbar.set_label('MAE', fontsize=11)
+
+                # Trend line (linear fit)
+                if np.std(conf_arr) > 1e-8:  # avoid degenerate case
+                    z = np.polyfit(conf_arr, loss_arr, 1)
+                    p = np.poly1d(z)
+                    x_line = np.linspace(conf_arr.min(), conf_arr.max(), 100)
+                    ax1.plot(x_line, p(x_line), 'r--', linewidth=2, label=f'Trend (slope={z[0]:.4f})')
+
+                    # Pearson correlation
+                    corr = np.corrcoef(conf_arr, loss_arr)[0, 1]
+                    ax1.set_title(f'{split_name.upper()} — Confidence vs Loss  (Pearson r = {corr:.3f})',
+                                  fontsize=13)
+                    ax1.legend(fontsize=10)
+                else:
+                    ax1.set_title(f'{split_name.upper()} — Confidence vs Loss  (constant confidence)',
+                                  fontsize=13)
+
+                ax1.set_xlabel('Learned Confidence (C)', fontsize=12)
+                ax1.set_ylabel('Reconstruction Loss', fontsize=12)
+                ax1.grid(True, alpha=0.3)
+                fig.tight_layout()
+                scatter_path = os.path.join(eval_plots_folder,
+                                            f"confidence_vs_loss_scatter_{split_name}.png")
+                fig.savefig(scatter_path, dpi=150)
+                plt.close(fig)
+                print(f"Saved confidence-vs-loss scatter to: {scatter_path}")
+
+                # --- Plot 2: Dual-axis sorted bar chart ---
+                sort_idx = np.argsort(loss_arr)[::-1]  # highest loss first
+                sorted_loss = loss_arr[sort_idx]
+                sorted_conf = conf_arr[sort_idx]
+                sorted_ids  = [sample_ids[i] for i in sort_idx]
+                x_pos = np.arange(len(sorted_loss))
+
+                fig2, ax_left = plt.subplots(figsize=(max(12, len(sorted_loss) * 0.18), 6))
+                ax_right = ax_left.twinx()
+
+                bar_width = 0.4
+                ax_left.bar(x_pos - bar_width/2, sorted_loss, bar_width,
+                            color='#e74c3c', alpha=0.75, label='Loss')
+                ax_right.bar(x_pos + bar_width/2, sorted_conf, bar_width,
+                             color='#2ecc71', alpha=0.75, label='Confidence')
+
+                ax_left.set_xlabel('Samples (sorted by loss, descending)', fontsize=11)
+                ax_left.set_ylabel('Reconstruction Loss', fontsize=11, color='#e74c3c')
+                ax_right.set_ylabel('Confidence (C)', fontsize=11, color='#2ecc71')
+                ax_left.tick_params(axis='y', labelcolor='#e74c3c')
+                ax_right.tick_params(axis='y', labelcolor='#2ecc71')
+
+                # Show sample IDs on x-axis if not too many
+                if len(sorted_ids) <= 80:
+                    ax_left.set_xticks(x_pos)
+                    ax_left.set_xticklabels(sorted_ids, rotation=90, fontsize=6)
+                else:
+                    ax_left.set_xticks([])
+
+                fig2.suptitle(f'{split_name.upper()} — Loss & Confidence per Sample (sorted by loss)',
+                              fontsize=13)
+                lines_left, labels_left = ax_left.get_legend_handles_labels()
+                lines_right, labels_right = ax_right.get_legend_handles_labels()
+                ax_left.legend(lines_left + lines_right, labels_left + labels_right,
+                               loc='upper right', fontsize=10)
+                fig2.tight_layout()
+                bar_path = os.path.join(eval_plots_folder,
+                                        f"confidence_vs_loss_bars_{split_name}.png")
+                fig2.savefig(bar_path, dpi=150)
+                plt.close(fig2)
+                print(f"Saved confidence-vs-loss bar chart to: {bar_path}")
+
+            # Summary
+            avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+            avg_psnr = np.mean(psnr_values) if psnr_values else 0.0
+            avg_ssim = np.mean(ssim_values) if ssim_values else 0.0
+            avg_rssi_diff = np.mean(rssi_diff_values) if rssi_diff_values else 0.0
+            avg_mae = np.mean(mae_values) if mae_values else 0.0
+            avg_render_time = np.mean(render_times) * 1000.0 if render_times else 0.0
+            avg_confidence = np.mean(confidence_values) if confidence_values else 0.0
+
+            print(f"\n--- {split_name.upper()} Evaluation Results ---")
+            print(f"Checkpoint Iteration: {loaded_iteration}")
+            print(f"Average Loss: {avg_loss:.7f}")
+            print(f"Average PSNR: {avg_psnr:.2f} dB")
+            print(f"Average SSIM: {avg_ssim:.4f}")
+            print(f"Average RSSI Difference: {avg_rssi_diff:.2f} dBm")
+            print(f"Average MAE: {avg_mae:.7f}")
+            print(f"Average Confidence: {avg_confidence:.4f}")
+            print(f"Average Render Time: {avg_render_time:.2f} ms")
+            print(f"-----------------------------------\n")
+
+            return {
+                "avg_loss": avg_loss,
+                "avg_psnr": avg_psnr,
+                "avg_ssim": avg_ssim,
+                "avg_rssi_diff": avg_rssi_diff,
+                "avg_mae": avg_mae,
+                "avg_confidence": avg_confidence,
+                "avg_render_time": avg_render_time,
+                "psnr_values": psnr_values,
+                "ssim_values": ssim_values,
+                "rssi_diff_values": rssi_diff_values,
+                "mae_values": mae_values,
+                "confidence_values": confidence_values,
+                "per_sample_rows": per_sample_rows,
+            }
+
+        # Evaluate test split only
+        test_results = evaluate_split("test", self.test_set)
+
+        # Log summary metrics to TensorBoard
+        self.writer.add_scalar('Loss/eval_test', test_results["avg_loss"], loaded_iteration)
+
+        self.writer.add_scalar('Time/avg_render_test_ms', test_results["avg_render_time"], loaded_iteration)
+
+        log_metric_distribution(self.writer, 'PSNR_test_eval', test_results["psnr_values"], loaded_iteration, unit=' (dB)')
+        log_metric_distribution(self.writer, 'SSIM_test_eval', test_results["ssim_values"], loaded_iteration)
+        log_metric_distribution(self.writer, 'RSSI_Difference_test_eval', test_results["rssi_diff_values"], loaded_iteration, unit=' (dBm)')
+        log_metric_distribution(self.writer, 'MAE_test_eval', test_results["mae_values"], loaded_iteration)
+        log_metric_distribution(self.writer, 'Confidence_test_eval', test_results["confidence_values"], loaded_iteration)
 
         print("Evaluation finished.")
 
@@ -673,17 +959,16 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/mimo-csi.yml', help='config file path')
-    parser.add_argument('--gpu', type=int, default=0)
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'eval'], help='Execution mode: train or eval') # Add 'eval' choice
+    parser.add_argument('--gpu', type=int, default=1)
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'eval'], help='Execution mode: train or eval')
     parser.add_argument('--dataset_type', type=str, default='mimo')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging for densification and pruning')
-    parser.add_argument('--num_test_plots', type=int, default=10, help='Number of test samples to plot after training (only used in train mode)') 
-    parser.add_argument('--plot_initial_gaussians', action='store_true', default=False, help='Plot the initial distribution of Gaussians') # Add default=False
-    parser.add_argument('--plot_final_gaussians', action='store_true', default=False, help='Plot the final distribution of Gaussians after training') # Add default=False
-    parser.add_argument('--checkpoint_interval', type=int, default=200000, help='Interval for saving model checkpoints (train mode)') # Add checkpoint interval argument
-    parser.add_argument('--checkpoint_dir', type=str, default="checkpoints", help='Subdirectory for saving/loading checkpoints') # Add checkpoint directory argument
-    parser.add_argument('--load_checkpoint', type=str, default=None, help='Path to checkpoint file to load for evaluation (eval mode)') # Argument for loading checkpoint
-    parser.add_argument('--eval_after_train', type=str, choices=['model','checkpoint','off'],default='model',help="After training, run evaluate() on: current 'model', latest 'checkpoint', or 'off'.")
+    parser.add_argument('--num_test_plots', type=int, default=10, help='Number of test samples to plot after training (only used in train mode)')
+    parser.add_argument('--plot_initial_gaussians', action='store_true', default=False, help='Plot the initial distribution of Gaussians')
+    parser.add_argument('--plot_final_gaussians', action='store_true', default=False, help='Plot the final distribution of Gaussians after training')
+    parser.add_argument('--checkpoint_interval', type=int, default=100000, help='Interval for saving model checkpoints (train mode)')
+    parser.add_argument('--checkpoint_dir', type=str, default="checkpoints", help='Subdirectory for saving/loading checkpoints')
+    parser.add_argument('--load_checkpoint', type=str, default=None, help='Path to checkpoint file to load for evaluation (eval mode)')
     args = parser.parse_args()
     torch.cuda.set_device(args.gpu)
 
@@ -711,7 +996,6 @@ if __name__ == '__main__':
                               num_test_plots=args.num_test_plots, 
                               plot_initial_gaussians=args.plot_initial_gaussians, # Pass argument
                               plot_final_gaussians=args.plot_final_gaussians, # Pass argument
-                              eval_after_train=args.eval_after_train,
                               **checkpoint_args, # Pass checkpoint arguments
                               **kwargs) 
 
@@ -769,4 +1053,3 @@ if __name__ == '__main__':
             log_file_handle.close()
         # Explicitly delete worker to trigger __del__ before script exits (optional but good practice)
         del worker
-

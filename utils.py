@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-import os
 import logging
 from math import exp
 import torch.nn.functional as F
@@ -14,7 +13,6 @@ class SpecificLogFilter(logging.Filter):
 def logger_config(log_savepath,logging_name):
     '''logger config
     '''
-    os.makedirs(os.path.dirname(log_savepath), exist_ok=True)
     # get logger name
     logger = logging.getLogger(logging_name)
     logger.setLevel(level=logging.DEBUG)
